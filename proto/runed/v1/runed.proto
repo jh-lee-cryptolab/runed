@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package runed.v1;
+
+option go_package = "github.com/CryptoLabInc/runed/gen/runed/v1;runedv1";
+
+// RunedService is the public gRPC surface exposed by the runed daemon.
+// Consumers connect over a Unix domain socket (macOS/Linux) or named pipe
+// (Windows). The service owns lifecycle of an underlying llama-server
+// child process that serves Qwen3-Embedding-0.6B GGUF.
+service RunedService {
+  // Embed returns an L2-normalized embedding vector for a single text.
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+
+  // EmbedBatch returns L2-normalized embeddings for a list of texts in a
+  // single forward pass. Preferred over N sequential Embed calls for
+  // throughput when batch_size <= max_batch_size.
+  rpc EmbedBatch(EmbedBatchRequest) returns (EmbedBatchResponse);
+
+  // Info returns daemon metadata: version, model identity, vector dim.
+  rpc Info(InfoRequest) returns (InfoResponse);
+
+  // Health reports runtime status of the daemon and its backend.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Shutdown requests a graceful drain. The daemon stops accepting new
+  // requests, completes in-flight ones, and exits.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+message EmbedRequest {
+  // Input text. Maximum length is InfoResponse.max_text_length characters.
+  // Exceeding the limit returns INVALID_ARGUMENT.
+  string text = 1;
+}
+
+message EmbedResponse {
+  // L2-normalized embedding. The server always normalizes output
+  // (llama.cpp default); no opt-out. Length equals InfoResponse.vector_dim.
+  repeated float vector = 1 [packed = true];
+}
+
+message EmbedBatchRequest {
+  // Input texts. Batch size must not exceed InfoResponse.max_batch_size.
+  // Each text individually bound by InfoResponse.max_text_length.
+  repeated string texts = 1;
+}
+
+message EmbedBatchResponse {
+  // One EmbedResponse per input text, same order as the request.
+  repeated EmbedResponse embeddings = 1;
+}
+
+message InfoRequest {}
+
+message InfoResponse {
+  // Daemon semantic version, e.g. "0.1.0-alpha".
+  string daemon_version = 1;
+
+  // Model identity hash. Changes invalidate stored embeddings (vector
+  // space incompatible). See design doc §7.3.
+  string model_identity = 2;
+
+  // Embedding dimensionality. 1024 for Qwen3-Embedding-0.6B.
+  int32 vector_dim = 3;
+
+  // Maximum input text length (in characters). Exceeding returns
+  // INVALID_ARGUMENT.
+  int32 max_text_length = 4;
+
+  // Maximum batch size accepted by EmbedBatch.
+  int32 max_batch_size = 5;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_OK = 1;
+    STATUS_LOADING = 2; // bootstrap: fetching llama-server, downloading embedding model
+    STATUS_DEGRADED = 3;
+    STATUS_SHUTTING_DOWN = 4;
+  }
+
+  // STATUS_LOADING sub-phase
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_FETCHING_LLAMA_SERVER = 1;
+    PHASE_FETCHING_MODEL = 2;
+    PHASE_STARTING_LLAMA_SERVER = 3;
+  }
+
+  Status status = 1;
+
+  // Seconds since daemon started serving requests.
+  int64 uptime_seconds = 2;
+
+  // Cumulative count of requests processed (Embed + EmbedBatch).
+  int64 total_requests = 3;
+
+  // Bootstrap sub-phase. PHASE_UNSPECIFIED outside STATUS_LOADING
+  Phase phase = 4;
+
+  // Download progress. bytes_total == 0 means totla size not yet known
+  int64 bytes_done = 5;
+  int64 bytes_total = 6;
+
+  // Detailed text for end-user display
+  string message = 7;
+}
+
+message ShutdownRequest {
+  // Maximum time in seconds to wait for in-flight requests to drain
+  // before forcing shutdown. Clamped to a daemon-chosen upper bound.
+  int32 grace_seconds = 1;
+}
+
+message ShutdownResponse {
+  // True if the daemon accepted the shutdown request and is now draining.
+  bool accepted = 1;
+}

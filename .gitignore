@@ -1,0 +1,8 @@
+scripts/.venv/
+*.gguf
+/bin/
+/dist/
+.DS_Store
+*.onnx
+/models/
+__pycache__/

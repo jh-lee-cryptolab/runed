@@ -1,0 +1,243 @@
+// Package backend manages the llama-server child process that runed uses
+// for Qwen3-Embedding inference.
+package backend
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
+	"sync"
+	"syscall"
+	"time"
+)
+
+type Config struct {
+	BinaryPath string
+	ModelPath  string
+	LogPath    string // if non-empty, stderr → file
+	Host       string // default 127.0.0.1
+	CtxSize    int    // default 2048; --ctx-size in tokens = max input length (llama-server rejects longer input with HTTP 400)
+}
+
+type LlamaBackend struct {
+	cfg  Config
+	cmd  *exec.Cmd
+	port int
+	mu   sync.Mutex
+}
+
+func NewLlamaBackend(cfg Config) *LlamaBackend {
+	if cfg.Host == "" {
+		cfg.Host = "127.0.0.1"
+	}
+	if cfg.CtxSize <= 0 {
+		cfg.CtxSize = 2048
+	}
+	return &LlamaBackend{cfg: cfg}
+}
+
+func (b *LlamaBackend) Port() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.port
+}
+
+// CtxSize returns the configured context size in tokens (= max input length).
+// Set once in NewLlamaBackend and never mutated, so no lock is needed.
+func (b *LlamaBackend) CtxSize() int { return b.cfg.CtxSize }
+
+// portRe matches llama-server's log line. The upstream format (observed) is:
+//
+//	main: server is listening on http://127.0.0.1:53183
+//
+// Older/alternate builds sometimes emit:
+//
+//	HTTP server listening on host 127.0.0.1, port 34567
+//
+// We accept either shape: host:port URL form, or explicit "port N" form.
+var portRe = regexp.MustCompile(`(?i)listening on .*?(?::(\d+)\b|port\s+(\d+))`)
+
+func (b *LlamaBackend) Start(ctx context.Context) error {
+	args := []string{
+		"--model", b.cfg.ModelPath,
+		"--embeddings",
+		"--pooling", "last",
+		"--ctx-size", strconv.Itoa(b.cfg.CtxSize),
+		"--host", b.cfg.Host,
+		"--port", "0", // OS-assigned
+	}
+	cmd := exec.CommandContext(ctx, b.cfg.BinaryPath, args...)
+
+	// Merged stdout+stderr (llama-server writes startup info to stderr mostly)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+	cmd.Stdout = cmd.Stderr // easier log collection
+
+	// OS-specific child termination guarantee
+	attachChildGuards(cmd)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	b.mu.Lock()
+	b.cmd = cmd
+	b.mu.Unlock()
+
+	var logW io.Writer = io.Discard
+	var logFile *os.File
+	if b.cfg.LogPath != "" {
+		f, err := os.Create(b.cfg.LogPath)
+		if err == nil {
+			logFile = f
+			logW = f
+		}
+	}
+
+	portCh := make(chan int, 1)
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		if logFile != nil {
+			defer logFile.Close()
+		}
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			fmt.Fprintln(logW, line)
+			if m := portRe.FindStringSubmatch(line); len(m) > 0 {
+				// Either capture group 1 (host:port form) or 2 ("port N" form)
+				// holds the digits. Pick whichever is non-empty.
+				var raw string
+				for _, g := range m[1:] {
+					if g != "" {
+						raw = g
+						break
+					}
+				}
+				if raw == "" {
+					continue
+				}
+				var p int
+				fmt.Sscanf(raw, "%d", &p)
+				select {
+				case portCh <- p:
+				default:
+				}
+			}
+		}
+	}()
+
+	// Wait for port + health
+	select {
+	case p := <-portCh:
+		b.mu.Lock()
+		b.port = p
+		b.mu.Unlock()
+	case <-scannerDone:
+		// Scanner ended before emitting a port → child likely exited early
+		// (bad model, OOM, etc.). Reap cmd and surface Wait's error.
+		waitErr := cmd.Wait()
+		b.mu.Lock()
+		b.cmd = nil
+		b.mu.Unlock()
+		if waitErr != nil {
+			return fmt.Errorf("llama-server exited before ready: %w", waitErr)
+		}
+		return fmt.Errorf("llama-server exited before ready")
+	case <-ctx.Done():
+		b.Stop(context.Background())
+		return fmt.Errorf("timed out waiting for llama-server port")
+	}
+
+	// Health poll up to 15s
+	healthCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	for {
+		if b.IsHealthy(healthCtx) {
+			return nil
+		}
+		select {
+		case <-scannerDone:
+			// Child exited during health polling.
+			waitErr := cmd.Wait()
+			b.mu.Lock()
+			b.cmd = nil
+			b.mu.Unlock()
+			if waitErr != nil {
+				return fmt.Errorf("llama-server exited during health check: %w", waitErr)
+			}
+			return fmt.Errorf("llama-server exited during health check")
+		case <-healthCtx.Done():
+			b.Stop(context.Background())
+			return fmt.Errorf("llama-server not healthy within deadline")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// getCmd returns the currently-running command under the mutex.
+// Returns nil if Start has not been called, Start failed, or Stop completed.
+func (b *LlamaBackend) getCmd() *exec.Cmd {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cmd
+}
+
+func (b *LlamaBackend) IsHealthy(ctx context.Context) bool {
+	port := b.Port()
+	if port == 0 {
+		return false
+	}
+	url := fmt.Sprintf("http://%s:%d/health", b.cfg.Host, port)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+func (b *LlamaBackend) Stop(ctx context.Context) error {
+	cmd := b.getCmd()
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	clear := func() {
+		b.mu.Lock()
+		b.cmd = nil
+		b.mu.Unlock()
+	}
+
+	select {
+	case <-done:
+		clear()
+		return nil
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		clear()
+		return nil
+	case <-ctx.Done():
+		_ = cmd.Process.Kill()
+		<-done
+		clear()
+		return ctx.Err()
+	}
+}

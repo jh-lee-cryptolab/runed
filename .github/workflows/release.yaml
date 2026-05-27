@@ -1,0 +1,21 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      # TODO: fetch release tarballs produced by the build workflow
+      #       (or rebuild here for darwin/arm64 + linux/amd64).
+      # TODO: create a GitHub Release for the pushed tag and attach
+      #       the tarballs as release assets.
+      - name: Stub
+        run: echo "release workflow stub — implementation TBD"
